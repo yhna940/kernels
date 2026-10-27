@@ -32,9 +32,25 @@ extern "C" {
   void* getMPSDevice() {
     return (__bridge void*)at::mps::MPSDevice::getInstance()->device();
   }
+}
 
-  // Get PyTorch's current MPS command queue (returns id<MTLCommandQueue> as void*)
-  void* getMPSCommandQueue() {
-    return (__bridge void*)at::mps::getCurrentMPSStream()->commandQueue();
-  }
+// Encode work on PyTorch's current MPS stream.
+//
+// `encode` runs on the stream's serial dispatch queue and receives the
+// stream's compute command encoder (id<MTLComputeCommandEncoder> as void*).
+// The encoder is owned by the stream (kernel coalescing): `encode` must not
+// call endEncoding() or commit, and must not throw. The work is ordered with
+// all other PyTorch MPS ops on the stream and is committed by PyTorch at the
+// next synchronization point.
+//
+// C++ linkage so `encode` matches an ordinary C++ function pointer. The stream
+// is read on the caller thread so this follows that thread's current MPS
+// stream (including torch.mps.stream on recent torch).
+void mpsEncodeOnStream(void (*encode)(void* encoder, void* ctx), void* ctx) {
+  at::mps::MPSStream* stream = at::mps::getCurrentMPSStream();
+  dispatch_sync(stream->queue(), ^() {
+    @autoreleasepool {
+      encode((__bridge void*)stream->commandEncoder(), ctx);
+    }
+  });
 }

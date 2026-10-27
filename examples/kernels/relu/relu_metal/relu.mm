@@ -44,12 +44,16 @@ torch::Tensor &dispatchReluKernel(torch::Tensor const &input,
                                               error:&error];
     TORCH_CHECK(reluPSO, error.localizedDescription.UTF8String);
 
-    id<MTLCommandBuffer> commandBuffer = torch::mps::get_command_buffer();
-    TORCH_CHECK(commandBuffer, "Failed to retrieve command buffer reference");
-
     dispatch_queue_t serialQueue = torch::mps::get_dispatch_queue();
 
     dispatch_sync(serialQueue, ^() {
+      // get_command_buffer() and commit() must be called on the MPS stream's
+      // serial queue: get_command_buffer() ends PyTorch's pending (coalesced)
+      // compute encoder, which is only safe while we own the queue. Recent
+      // torch also checks that with dispatch_assert_queue().
+      id<MTLCommandBuffer> commandBuffer = torch::mps::get_command_buffer();
+      TORCH_CHECK(commandBuffer, "Failed to retrieve command buffer reference");
+
       id<MTLComputeCommandEncoder> computeEncoder =
           [commandBuffer computeCommandEncoder];
       TORCH_CHECK(computeEncoder, "Failed to create compute command encoder");

@@ -42,8 +42,12 @@ void {{ kernel_name_normalized }}(torch::Tensor &out, torch::Tensor const &input
         [device newComputePipelineStateWithFunction:func error:&error];
     TORCH_CHECK(pso, error.localizedDescription.UTF8String);
 
-    id<MTLCommandBuffer> cmdBuf = torch::mps::get_command_buffer();
     dispatch_sync(torch::mps::get_dispatch_queue(), ^() {
+      // get_command_buffer() and commit() must run on the MPS stream's queue.
+      // get_command_buffer() ends PyTorch's coalesced encoder; calling it off
+      // the queue races other MPS work and trips dispatch_assert_queue on
+      // recent torch.
+      id<MTLCommandBuffer> cmdBuf = torch::mps::get_command_buffer();
       id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
       [encoder setComputePipelineState:pso];
       [encoder setBuffer:getMTLBufferStorage(input)

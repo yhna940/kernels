@@ -10,7 +10,7 @@
 // C interface from metallib_loader.mm
 extern "C" void* loadEmbeddedMetalLibrary(void* device, const char** errorMsg);
 extern "C" void* getMPSDevice();
-extern "C" void* getMPSCommandQueue();
+void mpsEncodeOnStream(void (*encode)(void* encoder, void* ctx), void* ctx);
 
 namespace {
 
@@ -36,15 +36,40 @@ MTL::Library* loadLibrary(MTL::Device* device) {
   return reinterpret_cast<MTL::Library*>(library);
 }
 
+struct ReluEncodeArgs {
+  MTL::ComputePipelineState* pipelineState;
+  MTL::Buffer* inputBuffer;
+  NS::UInteger inputOffset;
+  MTL::Buffer* outputBuffer;
+  NS::UInteger outputOffset;
+  NS::UInteger totalThreads;
+};
+
+// Runs on PyTorch's MPS serial queue; must not throw.
+void encodeRelu(void* encoderPtr, void* ctx) {
+  auto* encoder = reinterpret_cast<MTL::ComputeCommandEncoder*>(encoderPtr);
+  const auto* args = reinterpret_cast<const ReluEncodeArgs*>(ctx);
+
+  encoder->setComputePipelineState(args->pipelineState);
+  encoder->setBuffer(args->inputBuffer, args->inputOffset, 0);
+  encoder->setBuffer(args->outputBuffer, args->outputOffset, 1);
+
+  NS::UInteger threadGroupSize = args->pipelineState->maxTotalThreadsPerThreadgroup();
+  if (threadGroupSize > args->totalThreads) {
+    threadGroupSize = args->totalThreads;
+  }
+
+  encoder->dispatchThreads(MTL::Size::Make(args->totalThreads, 1, 1),
+                           MTL::Size::Make(threadGroupSize, 1, 1));
+  // No endEncoding()/commit(): the encoder belongs to PyTorch's MPS stream.
+}
+
 } // namespace
 
 void dispatchReluKernel(const torch::Tensor& input, torch::Tensor& output) {
-  // Use PyTorch's MPS device and command queue (these are borrowed references, not owned)
+  // Use PyTorch's MPS device (borrowed reference, not owned)
   MTL::Device* device = reinterpret_cast<MTL::Device*>(getMPSDevice());
   TORCH_CHECK(device != nullptr, "Failed to get MPS device");
-
-  MTL::CommandQueue* commandQueue = reinterpret_cast<MTL::CommandQueue*>(getMPSCommandQueue());
-  TORCH_CHECK(commandQueue != nullptr, "Failed to get MPS command queue");
 
   MTL::Library* libraryPtr = reinterpret_cast<MTL::Library*>(loadLibrary(device));
   NS::SharedPtr<MTL::Library> library = NS::TransferPtr(libraryPtr);
@@ -64,36 +89,22 @@ void dispatchReluKernel(const torch::Tensor& input, torch::Tensor& output) {
               "Failed to create compute pipeline state: ",
               pipelineError ? pipelineError->localizedDescription()->utf8String() : "Unknown error");
 
-  // Don't use SharedPtr for command buffer/encoder - they're managed by PyTorch's command queue
-  MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
-  TORCH_CHECK(commandBuffer != nullptr, "Failed to create Metal command buffer");
-
-  MTL::ComputeCommandEncoder* encoder = commandBuffer->computeCommandEncoder();
-  TORCH_CHECK(encoder != nullptr, "Failed to create compute command encoder");
-
-  encoder->setComputePipelineState(pipelineState.get());
-
   auto* inputBuffer = getMTLBuffer(input);
   auto* outputBuffer = getMTLBuffer(output);
   TORCH_CHECK(inputBuffer != nullptr, "Input buffer is null");
   TORCH_CHECK(outputBuffer != nullptr, "Output buffer is null");
 
-  encoder->setBuffer(inputBuffer, input.storage_offset() * input.element_size(), 0);
-  encoder->setBuffer(outputBuffer, output.storage_offset() * output.element_size(), 1);
-
-  const NS::UInteger totalThreads = input.numel();
-  NS::UInteger threadGroupSize = pipelineState->maxTotalThreadsPerThreadgroup();
-  if (threadGroupSize > totalThreads) {
-    threadGroupSize = totalThreads;
-  }
-
-  const MTL::Size gridSize = MTL::Size::Make(totalThreads, 1, 1);
-  const MTL::Size threadsPerThreadgroup = MTL::Size::Make(threadGroupSize, 1, 1);
-
-  encoder->dispatchThreads(gridSize, threadsPerThreadgroup);
-  encoder->endEncoding();
-
-  commandBuffer->commit();
+  // Encode on PyTorch's MPS stream instead of a separate command buffer, so the
+  // kernel is ordered with the ops that produce `input` and consume `output`.
+  ReluEncodeArgs args{
+      pipelineState.get(),
+      inputBuffer,
+      static_cast<NS::UInteger>(input.storage_offset() * input.element_size()),
+      outputBuffer,
+      static_cast<NS::UInteger>(output.storage_offset() * output.element_size()),
+      static_cast<NS::UInteger>(input.numel()),
+  };
+  mpsEncodeOnStream(&encodeRelu, &args);
 }
 
 void relu(torch::Tensor& out, const torch::Tensor& input) {
